@@ -1,0 +1,1023 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s nullglob
+
+# Build a fixed offline target rootfs for Calamares unpackfs.
+#
+# Inputs in ISO_PROFILE:
+#   pacman-cachyos.conf                Required target pacman configuration
+#   rootfs-packages.x86_64             Required pacman package list
+#   rootfs-aur-packages.x86_64         Optional AUR package list
+#   rootfs-flatpak-packages.txt        Optional Flatpak application IDs
+#   rootfs-overlay/                    Optional filesystem overlay
+#   rootfs-chroot.sh                   Optional script executed inside rootfs
+#
+# Output:
+#   airootfs/usr/share/calamares/rootfs.sqfs
+#
+# Usage:
+#   sudo ./build-rootfs.sh
+#
+# Examples:
+#   KEEP_ROOTFS=1 sudo ./build-rootfs.sh
+#   TIMEZONE=Europe/Moscow HOSTNAME_VALUE=seva-cachy sudo ./build-rootfs.sh
+#   ENABLE_DISPLAY_MANAGER=1 DISPLAY_MANAGER_UNIT=sddm.service sudo ./build-rootfs.sh
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+ISO_PROFILE="${ISO_PROFILE:-$SCRIPT_DIR}"
+WORKDIR="${WORKDIR:-$ISO_PROFILE/work-rootfs}"
+ROOTFS="${ROOTFS:-$WORKDIR/rootfs}"
+
+PACMAN_CONF_SOURCE="${PACMAN_CONF_SOURCE:-$ISO_PROFILE/pacman-cachyos.conf}"
+
+PACKAGES_FILE="${PACKAGES_FILE:-$ISO_PROFILE/rootfs-packages.x86_64}"
+AUR_PACKAGES_FILE="${AUR_PACKAGES_FILE:-$ISO_PROFILE/rootfs-aur-packages.x86_64}"
+FLATPAK_PACKAGES_FILE="${FLATPAK_PACKAGES_FILE:-$ISO_PROFILE/rootfs-flatpak-packages.txt}"
+ROOTFS_OVERLAY_DIR="${ROOTFS_OVERLAY_DIR:-$ISO_PROFILE/rootfs-overlay}"
+CHROOT_SCRIPT_SOURCE="${CHROOT_SCRIPT_SOURCE:-$ISO_PROFILE/rootfs-chroot.sh}"
+
+OUTDIR="${OUTDIR:-$ISO_PROFILE/airootfs/usr/share/calamares}"
+OUT_SQFS="${OUT_SQFS:-$OUTDIR/rootfs.sqfs}"
+
+ROOTFS_COMPRESSION="${ROOTFS_COMPRESSION:-zstd}"
+ROOTFS_ZSTD_LEVEL="${ROOTFS_ZSTD_LEVEL:-15}"
+
+TIMEZONE="${TIMEZONE:-Europe/Moscow}"
+HOSTNAME_VALUE="${HOSTNAME_VALUE:-cachyos-x86_64}"
+LOCALE_MAIN="${LOCALE_MAIN:-ru_RU.UTF-8}"
+LOCALE_EXTRA="${LOCALE_EXTRA:-en_US.UTF-8}"
+
+ENABLE_DISPLAY_MANAGER="${ENABLE_DISPLAY_MANAGER:-0}"
+DISPLAY_MANAGER_UNIT="${DISPLAY_MANAGER_UNIT:-sddm.service}"
+
+AUR_BUILD_USER="${AUR_BUILD_USER:-aurbuilder}"
+AUR_BUILD_DIR="/var/tmp/aurbuild"
+AUR_OUTPUT_DIR="/var/cache/aurbuild"
+AUR_KEEP_ARTIFACTS="${AUR_KEEP_ARTIFACTS:-0}"
+
+FLATPAK_REMOTE_NAME="${FLATPAK_REMOTE_NAME:-flathub}"
+FLATPAK_REMOTE_URL="${FLATPAK_REMOTE_URL:-https://dl.flathub.org/repo/flathub.flatpakrepo}"
+
+KEEP_ROOTFS="${KEEP_ROOTFS:-0}"
+
+declare -a ALL_PACKAGES=()
+declare -a BOOTSTRAP_PACKAGES=()
+declare -a KERNEL_PACKAGES=()
+declare -a AUR_PACKAGES=()
+declare -a FLATPAK_PACKAGES=()
+declare -a MOUNTS=()
+
+die() {
+  printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '\n\033[1;34m==> %s\033[0m\n' "$*"
+}
+
+warn() {
+  printf '\033[1;33mWARNING:\033[0m %s\n' "$*" >&2
+}
+
+require_root() {
+  ((EUID == 0)) || die "Run this script through sudo or as root."
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "Required file does not exist: $1"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 ||
+    die "Required command was not found: $1"
+}
+
+is_kernel_package() {
+  case "$1" in
+  linux | linux-lts | linux-zen | linux-hardened | linux-cachyos | linux-cachyos-*)
+    return 0
+    ;;
+  *)
+    return 1
+    ;;
+  esac
+}
+
+expected_kernel_image() {
+  case "$1" in
+  linux-cachyos)
+    printf '%s\n' "/boot/vmlinuz-linux-cachyos"
+    ;;
+  linux-cachyos-lts)
+    printf '%s\n' "/boot/vmlinuz-linux-cachyos-lts"
+    ;;
+  linux-cachyos-bore)
+    printf '%s\n' "/boot/vmlinuz-linux-cachyos-bore"
+    ;;
+  linux-cachyos-rc)
+    printf '%s\n' "/boot/vmlinuz-linux-cachyos-rc"
+    ;;
+  linux)
+    printf '%s\n' "/boot/vmlinuz-linux"
+    ;;
+  linux-lts)
+    printf '%s\n' "/boot/vmlinuz-linux-lts"
+    ;;
+  linux-zen)
+    printf '%s\n' "/boot/vmlinuz-linux-zen"
+    ;;
+  linux-hardened)
+    printf '%s\n' "/boot/vmlinuz-linux-hardened"
+    ;;
+  *)
+    printf '%s\n' ""
+    ;;
+  esac
+}
+
+read_list_file() {
+  local file="$1"
+  local array_name="$2"
+
+  if [[ ! -f "$file" ]]; then
+    eval "$array_name=()"
+    return 0
+  fi
+
+  mapfile -t "$array_name" < <(
+    sed \
+      -e 's/[[:space:]]*#.*$//' \
+      -e '/^[[:space:]]*$/d' \
+      "$file"
+  )
+}
+
+cleanup_mounts() {
+  local index mount_path
+
+  for ((index = ${#MOUNTS[@]} - 1; index >= 0; index--)); do
+    mount_path="${MOUNTS[$index]}"
+
+    if mountpoint -q "$mount_path"; then
+      umount -R "$mount_path" 2>/dev/null ||
+        umount -l "$mount_path" 2>/dev/null || true
+    fi
+  done
+
+  MOUNTS=()
+}
+
+cleanup() {
+  local status=$?
+
+  cleanup_mounts
+
+  if ((status != 0)); then
+    warn "Build failed."
+    warn "Rootfs kept for diagnosis: $ROOTFS"
+    warn "Work directory: $WORKDIR"
+  elif [[ "$KEEP_ROOTFS" == "1" ]]; then
+    info "KEEP_ROOTFS=1: rootfs retained at $ROOTFS"
+  else
+    rm -rf -- "$ROOTFS"
+  fi
+
+  exit "$status"
+}
+
+read_package_lists() {
+  read_list_file "$PACKAGES_FILE" ALL_PACKAGES
+  read_list_file "$AUR_PACKAGES_FILE" AUR_PACKAGES
+  read_list_file "$FLATPAK_PACKAGES_FILE" FLATPAK_PACKAGES
+
+  ((${#ALL_PACKAGES[@]} > 0)) ||
+    die "The main package list is empty: $PACKAGES_FILE"
+
+  local package
+  local base_found=0
+
+  for package in "${ALL_PACKAGES[@]}"; do
+    [[ "$package" == "base" ]] && base_found=1
+
+    if is_kernel_package "$package"; then
+      KERNEL_PACKAGES+=("$package")
+    else
+      BOOTSTRAP_PACKAGES+=("$package")
+    fi
+  done
+
+  ((base_found == 1)) ||
+    die "rootfs-packages.x86_64 must contain package: base"
+
+  ((${#KERNEL_PACKAGES[@]} > 0)) ||
+    die "No kernel package found. Add linux-cachyos to rootfs-packages.x86_64."
+
+  info "Kernel packages installed inside chroot:"
+  printf '  %s\n' "${KERNEL_PACKAGES[@]}"
+
+  if ((${#AUR_PACKAGES[@]} > 0)); then
+    info "AUR packages:"
+    printf '  %s\n' "${AUR_PACKAGES[@]}"
+  fi
+
+  if ((${#FLATPAK_PACKAGES[@]} > 0)); then
+    info "Flatpak applications:"
+    printf '  %s\n' "${FLATPAK_PACKAGES[@]}"
+  fi
+}
+
+check_prerequisites() {
+  info "Checking prerequisites"
+
+  require_root
+  require_file "$PACMAN_CONF_SOURCE"
+  require_file "$PACKAGES_FILE"
+
+  require_command pacstrap
+  require_command arch-chroot
+  require_command mksquashfs
+  require_command unsquashfs
+  require_command mount
+  require_command umount
+  require_command mountpoint
+  require_command install
+  require_command sed
+  require_command grep
+  require_command find
+  require_command sort
+  require_command sha256sum
+  require_command cp
+  require_command rsync
+
+  read_package_lists
+}
+
+prepare_directories() {
+  info "Preparing work directories"
+
+  cleanup_mounts
+
+  rm -rf -- "$ROOTFS"
+  rm -f -- "$OUT_SQFS" "$OUT_SQFS.sha256"
+
+  mkdir -p \
+    "$ROOTFS" \
+    "$WORKDIR" \
+    "$OUTDIR"
+}
+
+prepare_preinstall_files() {
+  info "Preparing files needed by package scriptlets"
+
+  mkdir -p "$ROOTFS/etc"
+
+  cat >"$ROOTFS/etc/lsb-release" <<'EOF'
+DISTRIB_ID=CachyOS
+DISTRIB_RELEASE=rolling
+DISTRIB_DESCRIPTION="CachyOS"
+DISTRIB_CODENAME=rolling
+EOF
+}
+
+bootstrap_rootfs() {
+  info "Installing repository packages, excluding kernels"
+
+  LC_ALL=C LANG=C pacstrap \
+    -K \
+    -G \
+    -M \
+    -C "$PACMAN_CONF_SOURCE" \
+    "$ROOTFS" \
+    "${BOOTSTRAP_PACKAGES[@]}"
+
+  install -Dm644 \
+    "$PACMAN_CONF_SOURCE" \
+    "$ROOTFS/etc/pacman.conf"
+}
+
+copy_target_mirrorlists() {
+  info "Copying mirrorlists to target rootfs"
+
+  mkdir -p "$ROOTFS/etc/pacman.d"
+
+  local filename
+  local source_file
+  local target_file
+
+  for filename in \
+    mirrorlist \
+    cachyos-mirrorlist \
+    cachyos-v3-mirrorlist \
+    cachyos-v4-mirrorlist; do
+
+    source_file="/etc/pacman.d/$filename"
+    target_file="$ROOTFS/etc/pacman.d/$filename"
+
+    [[ -f "$source_file" ]] || continue
+    install -Dm644 "$source_file" "$target_file"
+  done
+}
+
+validate_target_mirrorlists() {
+  info "Validating target pacman repository configuration"
+
+  local include_path
+  local target_path
+  local failure=0
+
+  while IFS= read -r include_path; do
+    target_path="$ROOTFS$include_path"
+
+    if [[ ! -s "$target_path" ]]; then
+      warn "Missing or empty target mirrorlist: $include_path"
+      failure=1
+      continue
+    fi
+
+    if ! grep -qE '^[[:space:]]*Server[[:space:]]*=' "$target_path"; then
+      warn "Target mirrorlist has no active Server lines: $include_path"
+      failure=1
+    fi
+  done < <(
+    sed -n -E \
+      's|^[[:space:]]*Include[[:space:]]*=[[:space:]]*(/etc/pacman\.d/[^[:space:]]+).*|\1|p' \
+      "$ROOTFS/etc/pacman.conf"
+  )
+
+  ((failure == 0)) ||
+    die "pacman.conf references missing target mirrorlists."
+}
+
+disable_checkspace_temporarily() {
+  info "Disabling CheckSpace for directory rootfs build"
+
+  sed -i -E \
+    's|^[[:space:]]*CheckSpace[[:space:]]*$|# CheckSpace disabled during rootfs construction|' \
+    "$ROOTFS/etc/pacman.conf"
+}
+
+restore_checkspace() {
+  info "Restoring CheckSpace in final target pacman.conf"
+
+  grep -qE '^[[:space:]]*CheckSpace[[:space:]]*$' \
+    "$ROOTFS/etc/pacman.conf" && return 0
+
+  sed -i \
+    '/^\[options\]/a CheckSpace' \
+    "$ROOTFS/etc/pacman.conf"
+}
+
+mount_chroot_filesystems() {
+  info "Mounting pseudo-filesystems for arch-chroot"
+
+  mkdir -p \
+    "$ROOTFS/dev" \
+    "$ROOTFS/dev/pts" \
+    "$ROOTFS/proc" \
+    "$ROOTFS/sys" \
+    "$ROOTFS/run"
+
+  mount --rbind /dev "$ROOTFS/dev"
+  mount --make-rslave "$ROOTFS/dev"
+  MOUNTS+=("$ROOTFS/dev")
+
+  mount -t proc proc "$ROOTFS/proc"
+  MOUNTS+=("$ROOTFS/proc")
+
+  mount -t sysfs sys "$ROOTFS/sys"
+  MOUNTS+=("$ROOTFS/sys")
+
+  mount -t tmpfs tmpfs "$ROOTFS/run"
+  MOUNTS+=("$ROOTFS/run")
+
+  if [[ -e /etc/resolv.conf ]]; then
+    rm -f "$ROOTFS/etc/resolv.conf"
+    cp -L /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
+  else
+    warn "Host resolver configuration is unavailable."
+  fi
+}
+
+write_chroot_lists() {
+  info "Writing package lists for chroot stages"
+
+  printf '%s\n' "${KERNEL_PACKAGES[@]}" \
+    >"$ROOTFS/root/kernel-packages.txt"
+
+  printf '%s\n' "${AUR_PACKAGES[@]}" \
+    >"$ROOTFS/root/aur-packages.txt"
+
+  printf '%s\n' "${FLATPAK_PACKAGES[@]}" \
+    >"$ROOTFS/root/flatpak-packages.txt"
+
+  chmod 0644 \
+    "$ROOTFS/root/kernel-packages.txt" \
+    "$ROOTFS/root/aur-packages.txt" \
+    "$ROOTFS/root/flatpak-packages.txt"
+}
+
+install_kernels() {
+  info "Installing kernels inside rootfs"
+
+  cat >"$ROOTFS/root/install-kernels.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+export LANG=C
+
+mapfile -t KERNELS < <(
+    sed \
+        -e 's/[[:space:]]*#.*$//' \
+        -e '/^[[:space:]]*$/d' \
+        /root/kernel-packages.txt
+)
+
+((${#KERNELS[@]} > 0)) || {
+    echo "No kernel packages supplied." >&2
+    exit 1
+}
+
+pacman -Sy --noconfirm \
+    archlinux-keyring \
+    cachyos-keyring \
+    cachyos-mirrorlist
+
+pacman -S --noconfirm \
+    mkinitcpio \
+    mkinitcpio-busybox \
+    kmod \
+    linux-firmware
+
+pacman -S --noconfirm "${KERNELS[@]}"
+
+echo
+echo "==> Kernel boot files:"
+find /boot -maxdepth 2 -type f -printf '  %P\n' | sort || true
+
+echo
+echo "==> mkinitcpio presets:"
+find /etc/mkinitcpio.d \
+    -maxdepth 1 \
+    -type f \
+    -name '*.preset' \
+    -printf '  %f\n' \
+    | sort || true
+EOF
+
+  chmod 0755 "$ROOTFS/root/install-kernels.sh"
+  arch-chroot "$ROOTFS" /root/install-kernels.sh
+  rm -f "$ROOTFS/root/install-kernels.sh"
+}
+
+apply_rootfs_overlay() {
+  if [[ ! -d "$ROOTFS_OVERLAY_DIR" ]]; then
+    info "No rootfs-overlay directory; skipping filesystem overlay"
+    return 0
+  fi
+
+  info "Applying rootfs overlay: $ROOTFS_OVERLAY_DIR"
+
+  # Trailing slash is required: copy contents, not parent directory.
+  # Numeric IDs prevent host user/group names from affecting target owners.
+  rsync \
+    -aHAX \
+    --numeric-ids \
+    "$ROOTFS_OVERLAY_DIR/" \
+    "$ROOTFS/"
+}
+
+install_aur_packages() {
+  ((${#AUR_PACKAGES[@]} > 0)) || {
+    info "No AUR packages requested"
+    return 0
+  }
+
+  info "Building AUR packages in target rootfs"
+
+  cat >"$ROOTFS/root/install-aur.sh" <<'CHROOT_AUR_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s nullglob
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+export LANG=C
+
+readonly BUILD_USER="__AUR_BUILD_USER__"
+readonly BUILD_DIR="__AUR_BUILD_DIR__"
+readonly OUTPUT_DIR="__AUR_OUTPUT_DIR__"
+readonly LIST_FILE="/root/aur-packages.txt"
+
+mapfile -t PACKAGES < <(
+    sed \
+        -e 's/[[:space:]]*#.*$//' \
+        -e '/^[[:space:]]*$/d' \
+        "$LIST_FILE"
+)
+
+((${#PACKAGES[@]} > 0)) || exit 0
+
+if ! getent passwd "$BUILD_USER" >/dev/null 2>&1; then
+    useradd \
+        --system \
+        --create-home \
+        --home-dir "/var/lib/$BUILD_USER" \
+        --shell /usr/bin/nologin \
+        "$BUILD_USER"
+fi
+
+install -d \
+    -o "$BUILD_USER" \
+    -g "$BUILD_USER" \
+    -m 0755 \
+    "$BUILD_DIR" \
+    "$OUTPUT_DIR"
+
+# These are installed in the target root before AUR builds begin.
+# makepkg runs as BUILD_USER, never as root.
+pacman -Syu --noconfirm \
+    base-devel \
+    git \
+    fakeroot \
+    debugedit \
+    pacman-contrib
+
+for package in "${PACKAGES[@]}"; do
+    printf '\n==> Building AUR package: %s\n' "$package"
+
+    source_dir="$BUILD_DIR/$package"
+    rm -rf -- "$source_dir"
+
+    runuser -u "$BUILD_USER" -- \
+        git clone \
+            --depth=1 \
+            "https://aur.archlinux.org/${package}.git" \
+            "$source_dir"
+
+    runuser -u "$BUILD_USER" -- \
+        bash -lc \
+        "set -Eeuo pipefail
+         cd '$source_dir'
+         makepkg --syncdeps --noconfirm --cleanbuild --clean"
+
+    built_packages=(
+        "$source_dir"/*.pkg.tar.zst
+        "$source_dir"/*.pkg.tar.xz
+    )
+
+    ((${#built_packages[@]} > 0)) || {
+        printf 'No package archive produced for AUR package: %s\n' \
+            "$package" >&2
+        exit 1
+    }
+
+    install -m 0644 \
+        "${built_packages[@]}" \
+        "$OUTPUT_DIR/"
+
+    pacman -U --noconfirm \
+        "${built_packages[@]}"
+done
+CHROOT_AUR_SCRIPT
+
+  sed -i \
+    -e "s|__AUR_BUILD_USER__|$AUR_BUILD_USER|g" \
+    -e "s|__AUR_BUILD_DIR__|$AUR_BUILD_DIR|g" \
+    -e "s|__AUR_OUTPUT_DIR__|$AUR_OUTPUT_DIR|g" \
+    "$ROOTFS/root/install-aur.sh"
+
+  chmod 0755 "$ROOTFS/root/install-aur.sh"
+
+  arch-chroot "$ROOTFS" /root/install-aur.sh
+
+  rm -f "$ROOTFS/root/install-aur.sh"
+}
+
+install_flatpak_packages() {
+  ((${#FLATPAK_PACKAGES[@]} > 0)) || {
+    info "No Flatpak packages requested"
+    return 0
+  }
+
+  info "Installing system Flatpak applications into rootfs"
+
+  cat >"$ROOTFS/root/install-flatpaks.sh" <<'CHROOT_FLATPAK_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+export LANG=C
+
+readonly REMOTE_NAME="__FLATPAK_REMOTE_NAME__"
+readonly REMOTE_URL="__FLATPAK_REMOTE_URL__"
+readonly LIST_FILE="/root/flatpak-packages.txt"
+
+mapfile -t APPS < <(
+    sed \
+        -e 's/[[:space:]]*#.*$//' \
+        -e '/^[[:space:]]*$/d' \
+        "$LIST_FILE"
+)
+
+if ((${#APPS[@]} == 0)); then
+    echo "No Flatpak application IDs supplied."
+    exit 0
+fi
+
+echo "==> Flatpak remote: $REMOTE_NAME"
+echo "==> Flatpak applications:"
+printf '  %s\n' "${APPS[@]}"
+
+# Usually these already exist in rootfs-packages.x86_64, but this makes
+# Flatpak phase self-contained if the list is non-empty.
+pacman -Syu --noconfirm \
+    flatpak \
+    xdg-desktop-portal \
+    xdg-desktop-portal-kde
+
+flatpak remote-add \
+    --system \
+    --if-not-exists \
+    "$REMOTE_NAME" \
+    "$REMOTE_URL"
+
+flatpak install \
+    --system \
+    --noninteractive \
+    --assumeyes \
+    "$REMOTE_NAME" \
+    "${APPS[@]}"
+
+# Verify every requested app is actually included in target rootfs.
+for app in "${APPS[@]}"; do
+    flatpak info --system "$app" >/dev/null
+done
+
+# Clean and verify Flatpak's system installation metadata.
+flatpak repair --system
+CHROOT_FLATPAK_SCRIPT
+
+  sed -i \
+    -e "s|__FLATPAK_REMOTE_NAME__|$FLATPAK_REMOTE_NAME|g" \
+    -e "s|__FLATPAK_REMOTE_URL__|$FLATPAK_REMOTE_URL|g" \
+    "$ROOTFS/root/install-flatpaks.sh"
+
+  chmod 0755 "$ROOTFS/root/install-flatpaks.sh"
+
+  arch-chroot "$ROOTFS" /root/install-flatpaks.sh
+
+  rm -f "$ROOTFS/root/install-flatpaks.sh"
+}
+
+run_custom_chroot_script() {
+  if [[ ! -f "$CHROOT_SCRIPT_SOURCE" ]]; then
+    info "No rootfs-chroot.sh found; skipping custom chroot script"
+    return 0
+  fi
+
+  info "Running rootfs-chroot.sh inside target rootfs"
+
+  install -Dm755 \
+    "$CHROOT_SCRIPT_SOURCE" \
+    "$ROOTFS/root/rootfs-chroot.sh"
+
+  arch-chroot "$ROOTFS" /root/rootfs-chroot.sh
+
+  rm -f "$ROOTFS/root/rootfs-chroot.sh"
+}
+
+configure_defaults() {
+  info "Configuring rootfs defaults"
+
+  cat >"$ROOTFS/root/configure-defaults.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+enable_locale() {
+    local locale="$1"
+
+    if grep -qE "^#?${locale}[[:space:]]+UTF-8$" /etc/locale.gen; then
+        sed -i \
+            -E "s|^#(${locale}[[:space:]]+UTF-8)$|\1|" \
+            /etc/locale.gen
+    else
+        printf '%s UTF-8\n' "$locale" >> /etc/locale.gen
+    fi
+}
+
+ln -sf "/usr/share/zoneinfo/$TIMEZONE_VALUE" /etc/localtime
+
+enable_locale "$LOCALE_MAIN_VALUE"
+enable_locale "$LOCALE_EXTRA_VALUE"
+locale-gen
+
+cat > /etc/locale.conf <<EOF_LOCALE
+LANG=$LOCALE_MAIN_VALUE
+EOF_LOCALE
+
+cat > /etc/vconsole.conf <<'EOF_VCONSOLE'
+KEYMAP=ruwin_alt_sh-UTF-8
+FONT=cyr-sun16
+EOF_VCONSOLE
+
+printf '%s\n' "$HOSTNAME_VALUE_CHROOT" > /etc/hostname
+
+cat > /etc/hosts <<EOF_HOSTS
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 $HOSTNAME_VALUE_CHROOT.localdomain $HOSTNAME_VALUE_CHROOT
+EOF_HOSTS
+
+if systemctl list-unit-files NetworkManager.service >/dev/null 2>&1; then
+    systemctl enable NetworkManager.service
+fi
+
+if systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1; then
+    systemctl enable systemd-timesyncd.service
+fi
+
+if [[ "$ENABLE_DM_VALUE" == "1" ]] && \
+   systemctl list-unit-files "$DISPLAY_MANAGER_UNIT_VALUE" >/dev/null 2>&1; then
+    systemctl enable "$DISPLAY_MANAGER_UNIT_VALUE"
+fi
+EOF
+
+  chmod 0755 "$ROOTFS/root/configure-defaults.sh"
+
+  TIMEZONE_VALUE="$TIMEZONE" \
+    HOSTNAME_VALUE_CHROOT="$HOSTNAME_VALUE" \
+    LOCALE_MAIN_VALUE="$LOCALE_MAIN" \
+    LOCALE_EXTRA_VALUE="$LOCALE_EXTRA" \
+    ENABLE_DM_VALUE="$ENABLE_DISPLAY_MANAGER" \
+    DISPLAY_MANAGER_UNIT_VALUE="$DISPLAY_MANAGER_UNIT" \
+    arch-chroot "$ROOTFS" /root/configure-defaults.sh
+
+  rm -f "$ROOTFS/root/configure-defaults.sh"
+}
+
+clean_rootfs() {
+  info "Cleaning unique, transient, and build-only state"
+
+  rm -f \
+    "$ROOTFS/etc/fstab" \
+    "$ROOTFS/etc/crypttab" \
+    "$ROOTFS/etc/machine-id" \
+    "$ROOTFS/var/lib/dbus/machine-id" \
+    "$ROOTFS/etc/resolv.conf" \
+    "$ROOTFS/root/kernel-packages.txt" \
+    "$ROOTFS/root/aur-packages.txt" \
+    "$ROOTFS/root/flatpak-packages.txt"
+
+  : >"$ROOTFS/etc/machine-id"
+
+  rm -f "$ROOTFS/etc/ssh/ssh_host_"* 2>/dev/null || true
+
+  if [[ -d "$ROOTFS/etc/NetworkManager/system-connections" ]]; then
+    find "$ROOTFS/etc/NetworkManager/system-connections" \
+      -mindepth 1 \
+      -maxdepth 1 \
+      -type f \
+      -delete
+  fi
+
+  rm -rf \
+    "$ROOTFS/var/log/"* \
+    "$ROOTFS/var/tmp/"* \
+    "$ROOTFS/tmp/"* \
+    "$ROOTFS/root/.cache/"* \
+    "$ROOTFS/var/cache/fontconfig/"* \
+    "$ROOTFS/var/lib/systemd/coredump/"*
+
+  mkdir -p \
+    "$ROOTFS/var/log" \
+    "$ROOTFS/var/tmp" \
+    "$ROOTFS/tmp"
+
+  chmod 1777 "$ROOTFS/var/tmp" "$ROOTFS/tmp"
+
+  find "$ROOTFS/var/cache/pacman/pkg" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type f \
+    -delete 2>/dev/null || true
+
+  rm -rf "$ROOTFS/var/lib/pacman/sync/"*
+
+  if [[ "$AUR_KEEP_ARTIFACTS" != "1" ]]; then
+    rm -rf \
+      "$ROOTFS$AUR_BUILD_DIR" \
+      "$ROOTFS$AUR_OUTPUT_DIR" \
+      "$ROOTFS/var/lib/$AUR_BUILD_USER"
+  fi
+
+  # The temporary AUR build user must not exist in installed target.
+  for file in \
+    "$ROOTFS/etc/passwd" \
+    "$ROOTFS/etc/shadow" \
+    "$ROOTFS/etc/group" \
+    "$ROOTFS/etc/gshadow"; do
+
+    [[ -f "$file" ]] || continue
+    sed -i "/^${AUR_BUILD_USER}:/d" "$file"
+  done
+
+  find "$ROOTFS" \
+    -xdev \
+    -type f \
+    \( -name '*.pyc' -o -name '*.pyo' \) \
+    -delete 2>/dev/null || true
+}
+
+validate_rootfs() {
+  info "Validating final rootfs"
+
+  local path
+  local kernel
+  local image
+
+  local required_paths=(
+    "$ROOTFS/etc/pacman.conf"
+    "$ROOTFS/etc/machine-id"
+    "$ROOTFS/usr/bin/pacman"
+    "$ROOTFS/var/lib/pacman/local"
+    "$ROOTFS/usr/lib/modules"
+  )
+
+  for path in "${required_paths[@]}"; do
+    [[ -e "$path" ]] || die "Missing required rootfs path: $path"
+  done
+
+  [[ ! -e "$ROOTFS/etc/fstab" ]] ||
+    die "/etc/fstab is present. Calamares must generate it."
+
+  [[ ! -s "$ROOTFS/etc/machine-id" ]] ||
+    die "/etc/machine-id must be empty in the distributed rootfs."
+
+  arch-chroot "$ROOTFS" pacman -Q >/dev/null
+
+  for kernel in "${KERNEL_PACKAGES[@]}"; do
+    image="$(expected_kernel_image "$kernel")"
+
+    [[ -n "$image" ]] || continue
+    [[ -e "$ROOTFS$image" ]] ||
+      die "Expected kernel image is missing: $image"
+  done
+
+  if ! find "$ROOTFS/boot" \
+    -maxdepth 2 \
+    -type f \
+    -name 'initramfs-*.img' \
+    -print -quit | grep -q .; then
+
+    die "No initramfs image exists in rootfs /boot."
+  fi
+
+  if ((${#AUR_PACKAGES[@]} > 0)); then
+    local aur_package
+
+    for aur_package in "${AUR_PACKAGES[@]}"; do
+      arch-chroot "$ROOTFS" pacman -Q "$aur_package" >/dev/null ||
+        die "AUR package is not installed: $aur_package"
+    done
+  fi
+
+  if ((${#FLATPAK_PACKAGES[@]} > 0)); then
+    local flatpak_app
+
+    for flatpak_app in "${FLATPAK_PACKAGES[@]}"; do
+      arch-chroot "$ROOTFS" \
+        flatpak info --system "$flatpak_app" >/dev/null ||
+        die "Flatpak app is not installed: $flatpak_app"
+    done
+  fi
+
+  info "Final kernel boot files:"
+  find "$ROOTFS/boot" \
+    -maxdepth 2 \
+    -type f \
+    -printf '  %P\n' |
+    sort
+}
+
+create_squashfs() {
+  info "Creating rootfs SquashFS payload"
+
+  local -a compression_args=()
+
+  case "$ROOTFS_COMPRESSION" in
+  zstd)
+    compression_args=(
+      -comp zstd
+      -Xcompression-level "$ROOTFS_ZSTD_LEVEL"
+    )
+    ;;
+  xz)
+    compression_args=(
+      -comp xz
+    )
+    ;;
+  lz4)
+    compression_args=(
+      -comp lz4
+    )
+    ;;
+  *)
+    die "Unsupported ROOTFS_COMPRESSION: $ROOTFS_COMPRESSION"
+    ;;
+  esac
+
+  mksquashfs \
+    "$ROOTFS" \
+    "$OUT_SQFS" \
+    "${compression_args[@]}" \
+    -b 1M \
+    -noappend \
+    -wildcards \
+    -e 'dev/*' \
+    'proc/*' \
+    'sys/*' \
+    'run/*' \
+    'tmp/*' \
+    'var/tmp/*'
+
+  [[ -s "$OUT_SQFS" ]] || die "rootfs.sqfs was not created."
+}
+
+validate_squashfs() {
+  info "Validating rootfs SquashFS payload"
+
+  unsquashfs -s "$OUT_SQFS"
+
+  local listing
+  listing="$(unsquashfs -l "$OUT_SQFS")"
+
+  grep -q 'squashfs-root/usr/bin/pacman' <<<"$listing" ||
+    die "rootfs.sqfs does not contain pacman."
+
+  grep -q 'squashfs-root/var/lib/pacman/local' <<<"$listing" ||
+    die "rootfs.sqfs does not contain pacman local database."
+
+  grep -q 'squashfs-root/usr/lib/modules' <<<"$listing" ||
+    die "rootfs.sqfs does not contain kernel modules."
+
+  local kernel
+  local image
+
+  for kernel in "${KERNEL_PACKAGES[@]}"; do
+    image="$(expected_kernel_image "$kernel")"
+
+    [[ -n "$image" ]] || continue
+
+    grep -q "squashfs-root${image}" <<<"$listing" ||
+      die "rootfs.sqfs does not contain: $image"
+  done
+
+  sha256sum "$OUT_SQFS" | tee "$OUT_SQFS.sha256"
+  du -h "$OUT_SQFS"
+}
+
+main() {
+  trap cleanup EXIT INT TERM
+
+  check_prerequisites
+  prepare_directories
+  prepare_preinstall_files
+
+  bootstrap_rootfs
+  copy_target_mirrorlists
+  validate_target_mirrorlists
+  disable_checkspace_temporarily
+
+  mount_chroot_filesystems
+  write_chroot_lists
+
+  install_kernels
+  install_aur_packages
+  install_flatpak_packages
+
+  # Overlay after package installation: custom configs can replace defaults.
+  apply_rootfs_overlay
+
+  # User script after overlay: ideal for systemctl enable / chmod / chown.
+  run_custom_chroot_script
+
+  configure_defaults
+  restore_checkspace
+
+  cleanup_mounts
+  clean_rootfs
+  validate_rootfs
+  create_squashfs
+  validate_squashfs
+
+  info "Rootfs build completed successfully."
+  info "Payload: $OUT_SQFS"
+  info "Checksum: $OUT_SQFS.sha256"
+}
+
+main "$@"

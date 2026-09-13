@@ -1,0 +1,5 @@
+out
+build
+work-rootfs
+airootfs/etc/sudoers.d
+airootfs/usr/share/calamares/rootfs.sqfs

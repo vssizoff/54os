@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CachyOS Offline Installer
+Comment=Start the offline operating system installer
+Exec=bash /usr/local/lib/calamares/start-offline-installer-user
+Terminal=false
+OnlyShowIn=KDE;
+X-KDE-autostart-after=panel
+X-KDE-StartupNotify=true

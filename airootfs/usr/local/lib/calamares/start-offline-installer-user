@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+sudo bash /usr/local/lib/calamares/apply-offline-module-overrides
+sudo losetup --find --show /usr/share/calamares/rootfs.sqfs
+sudo /usr/bin/calamares

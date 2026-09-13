@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Apply local Calamares module config overrides first.
+# This must finish before the installer process starts.
+bash /usr/local/lib/calamares/apply-offline-module-overrides
+
+# Do not use "sudo calamares": this service is already root.
+# `exec` makes systemd track the actual Calamares process.
+exec /usr/bin/calamares
