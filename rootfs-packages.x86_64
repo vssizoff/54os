@@ -190,6 +190,9 @@ kbd
 ###############################################################################
 
 firefox
+chromium
+zen-browser-bin
+
 
 git
 curl
@@ -247,3 +250,12 @@ cachyos-fish-config
 yazi
 loupe
 atac
+
+libreoffice-still
+codeblocks
+cmake
+
+btop
+bpython
+bat
+tailscale
