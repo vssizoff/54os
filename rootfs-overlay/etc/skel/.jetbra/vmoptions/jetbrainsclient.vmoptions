@@ -19,4 +19,3 @@
 --add-opens=java.base/jdk.internal.org.objectweb.asm=ALL-UNNAMED
 --add-opens=java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED
 
--javaagent:/home/sizoff/iso/cachy-offline/rootfs-overlay/etc/skel/.jetbra/ja-netfilter.jar=jetbrains
